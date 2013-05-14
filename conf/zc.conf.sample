@@ -1,0 +1,68 @@
+loadmodule checker;
+loadmodule tcp zabbix mysql memcache http;
+#loadmodule http;
+maxworkers 40;
+maxspareworkers 20;
+minspareworkers 5;
+startworkers 10;
+logfile logs/error.log;
+// #comment
+#loglevel info;
+loglevel info;
+# //comment
+//loglevel warning;
+user daemon;
+group daemon;
+checker {
+	service_interval 60s;
+	host_interval 600s;
+	zbx_servers xxx.xxx.xxx.xxx xxx.xxx.xxx.xxx;
+	host_group 'test' {
+		host xxx.xxx.xxx.xxx {
+		//host 'name' {
+			define ip xxx.xxx.xxx.xxx;
+			zbx on;
+			service tcp_80 {
+				type tcp;
+				tcp_host %ip;
+				tcp_port 1975;
+				tcp_connect_timeout 10;
+			}
+			service tcp_8080 {
+				type tcp;
+				tcp_host %ip;
+				tcp_port 80;
+				tcp_connect_timeout 10;
+			}
+			service mysql_3306 {
+				type mysql;
+				mysql_host localhost;
+				mysql_port 3306;
+				mysql_user test;
+				mysql_passwd '';
+				mysql_socket '/data/mysql/var/mysql.sock';
+			}
+			service 'memcache_13301' {
+				type memcache;
+				mc_host xxx.xxx.xxx.xxx;
+				mc_port 13301;
+				mc_socket_timeout 3s;
+			}
+			service 'http80' {
+				type http;
+				# Mutiple line comment
+				/*
+				http_proxy_host xxx.xxx.xxx.xxx;
+				http_proxy_port 80;
+				*/
+				http_url 'http://xxx.xxx.xxx.xxx/';
+				http_connect_timeout 3;
+				http_timeout 5;
+				http_method 'HEAD';
+				http_headers 'host: xxx.com'
+			}
+	
+		}
+	}
+}
+

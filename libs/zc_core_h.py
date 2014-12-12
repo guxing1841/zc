@@ -6,7 +6,7 @@ Copyright (C) Zhou Changrong
 import os, sys
 
 ZC_CORE_MODULE = 1
-class zc_core_module_ctx():
+class zc_core_module_ctx:
 	def __init__(self, **args):
 		self.init_master = None
 		self.init_process = None
@@ -20,7 +20,7 @@ class zc_core_module_ctx():
 				os._exit(1)
 
 
-class zc_module():
+class zc_module:
 	def __init__(self, **args):
 		self.ctx_index = -1
 		self.name = None
@@ -28,6 +28,7 @@ class zc_module():
 		self.type = -1
 		self.commands = None
 		self.init_master = None
+		self.init_process = None
 		self.process_task = None
 		self.ctx = None
 		for key in args.keys():
@@ -51,7 +52,7 @@ class zc_module():
 				raise TypeError, "zc_module() got an unexpected keyword argument '%s'" %(key)
 				os._exit(1)
 
-class zc_command():
+class zc_command:
 	def __init__(self, **args):
 		self.ctx_index = -1
 		self.name = None
@@ -90,7 +91,7 @@ def kill_pids(pids, sig):
 		except:
 			continue
 
-class pid_file():
+class pid_file:
 	def __init__(self, file):
 		self.file = file
 	def write(self, pids):

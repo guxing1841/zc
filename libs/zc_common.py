@@ -18,8 +18,8 @@ def sock_send(sock, s, length = None):
 	while wbytes < length:
 		try:
 			wbytes += sock.send(s[wbytes: length])
-		except socket.error as e:
-			raise ZC_Error, 'errno %d: %s' %(e.errno, e.strerror)
+		except socket.error, e:
+			raise ZC_Error, '%s' %(e)
 	return wbytes
 
 def sock_recv(sock, length):
@@ -27,8 +27,8 @@ def sock_recv(sock, length):
 	while len(s) < length:
 		try:
 			buf = sock.recv(length-len(s))
-		except socket.error as e:
-			raise ZC_Error, 'errno %d: %s' %(e.errno, e.strerror)
+		except socket.error, e:
+			raise ZC_Error, '%s' %(e)
 		if buf == "":
 			break
 		s += buf
@@ -41,16 +41,16 @@ def fd_send(fd, s, length = None):
 	while wbytes < length:
 		try:
 			wbytes += os.write(fd, s[wbytes: length])
-		except OSError as e:
-			raise ZC_Error, 'errno %d: %s' %(e.errno, e.strerror)
+		except OSError, e:
+			raise ZC_Error, '%s' %(e)
 
 def fd_recv(fd, length):
 	s = ''
 	while len(s) < length:
 		try:
 			buf = os.read(fd, length-len(s))
-		except OSError as e:
-			raise ZC_Error, 'errno %d: %s' %(e.errno, e.strerror)
+		except OSError, e:
+			raise ZC_Error, '%s' %(e)
 		if buf == "":
 			break
 		s += buf
@@ -63,7 +63,7 @@ def split_lines(s):
 	while start < length:
 		try:
 			idx = s.index('\n', start)
-		except ValueError as e:
+		except ValueError, e:
 			break
 		lines.append(s[start:idx+1])
 		start = idx+1

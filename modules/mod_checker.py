@@ -16,10 +16,14 @@ def merge_main_conf(cf, parent, child):
 	pctx = parent['ctx']
 	for m in cf.child_modules['checker']:
 		if m.ctx != None and m.ctx.merge_main_conf != None:
-			if m.ctx.merge_main_conf(cf, parent, child) != ZC_OK:
+			rc = m.ctx.merge_main_conf(cf, parent, child)
+			if rc == ZC_IGNORE:
+				ctx['disable'] = True
+				return ZC_IGNORE
+			elif rc != ZC_OK:
 				return ZC_ERROR
 	for gconf in child['groups']:
-		if merge_group_conf(cf, child, gconf) != ZC_OK:
+		if merge_group_conf(cf, child, gconf) == ZC_ERROR:
 			return ZC_ERROR
 	return ZC_OK
 
@@ -30,13 +34,13 @@ def merge_group_conf(cf, parent, child):
 		return ZC_IGNORE
 	keys = pctx['sets'].keys()
 	zc_dict_set_no_has(ctx['sets'], pctx['sets'], *keys)
-	zc_dict_set_no_has(ctx, pctx, 'host_interval', 'service_interval', 'active_servers')
+	zc_dict_set_no_has(ctx, pctx, 'host_interval', 'service_interval')
 	for m in cf.child_modules['checker']:
 		if m.ctx != None and m.ctx.merge_group_conf != None:
 			rc = m.ctx.merge_group_conf(cf, parent, child)
 			if rc == ZC_IGNORE:
 				ctx['disable'] = True
-				return ZC_OK
+				return ZC_IGNORE
 			elif rc != ZC_OK:
 				return ZC_ERROR
 	for hconf in child['hosts']:
@@ -51,14 +55,14 @@ def merge_host_conf(cf, parent, child):
 		return ZC_IGNORE
 	keys = pctx['sets'].keys()
 	zc_dict_set_no_has(ctx['sets'], pctx['sets'], *keys)
-	zc_dict_set_no_has(ctx, pctx, 'host_interval', 'service_interval', 'active_servers')
+	zc_dict_set_no_has(ctx, pctx, 'host_interval', 'service_interval')
 	ctx['host_interval'] = zc_dict_get_gt(ctx, 'host_interval', 0, CHECKER_DEF_HOST_INTERVAL)
 	for m in cf.child_modules['checker']:
 		if m.ctx != None and m.ctx.merge_host_conf != None:
 			rc = m.ctx.merge_host_conf(cf, parent, child)
 			if rc == ZC_IGNORE:
 				ctx['disable'] = True
-				return ZC_OK
+				return ZC_IGNORE
 			elif rc != ZC_OK:
 				return ZC_ERROR
 	for sconf in child['services']:
@@ -73,7 +77,7 @@ def merge_service_conf(cf, parent, child):
 		return ZC_IGNORE
 	keys = pctx['sets'].keys()
 	zc_dict_set_no_has(ctx['sets'], pctx['sets'], *keys)
-	zc_dict_set_no_has(ctx, pctx, 'host_interval', 'service_interval', 'active_servers')
+	zc_dict_set_no_has(ctx, pctx, 'host_interval', 'service_interval')
 	ctx['service_interval'] = zc_dict_get_gt(ctx, 'service_interval', 0, CHECKER_DEF_SVC_INTERVAL)
 	for m in cf.child_modules['checker']:
 		if m.ctx != None and m.ctx.merge_service_conf != None:
@@ -165,7 +169,7 @@ def group_block(cf, cmd, conf):
 	for m in cf.child_modules['checker']:
 		cf.conf['modules'].append({})
 		i += 1
-	for key in pconf['ctx']['defines'].keys():
+	for key in pconf['ctx']['defines']:
 		cf.conf['ctx']['defines'][key] = pconf['ctx']['defines'][key]
 	if cf.file_parser() == ZC_ERROR:
 		return ZC_ERROR
@@ -206,7 +210,7 @@ def host_block(cf, cmd, conf):
 	for m in cf.child_modules['checker']:
 		cf.conf['modules'].append({})
 		i += 1
-	for key in pconf['ctx']['defines'].keys():
+	for key in pconf['ctx']['defines']:
 		cf.conf['ctx']['defines'][key] = pconf['ctx']['defines'][key]
 	if cf.file_parser() == ZC_ERROR:
 		return ZC_ERROR
@@ -245,13 +249,13 @@ def service_block(cf, cmd, conf):
 	for m in cf.child_modules['checker']:
 		cf.conf['modules'].append({})
 		i += 1
-	for key in pconf['ctx']['defines'].keys():
+	for key in pconf['ctx']['defines']:
 		cf.conf['ctx']['defines'][key] = pconf['ctx']['defines'][key]
 	if cf.file_parser() == ZC_ERROR:
 		return ZC_ERROR
 	del cf.conf['ctx']['defines']
 	if 'type' not in cf.conf['ctx']:
-		cf.log.error("Server '%s' type is not set in %s at line %d\n" %(name, cf.cur['conf_file'], cf.cur['start_line']))
+		cf.log.error("Service '%s' type is not set in %s at line %d\n" %(name, cf.cur['conf_file'], cf.cur['start_line']))
 		return ZC_ERROR
 	cf.conf = pconf
 	cf.type = ptype
@@ -266,7 +270,6 @@ def zc_set_svc_type(cf, cmd, conf):
 		return ZC_ERROR
 	return zc_conf_set_str_slot(cf, cmd, conf)
 
-
 def host_process_task(log, t):
 	for h in t['record_handlers']:
 		h(log, t)
@@ -275,8 +278,8 @@ def host_process_task(log, t):
 def in_list(t, d):
 	for v in t:
 		if len(v) > 0:
-			if v[0:1] == '~':
-				if re.match(v[1:], d):
+			if v[0] == '~':
+				if re.search(v[1:], d):
 					return True
 		if v == d:
 			return True
@@ -290,7 +293,7 @@ def service_process_task(log, t):
 	ignore_list = t['conf']['ctx'].get('service_record_ignore')
 	match_list = t['conf']['ctx'].get('service_record_match')
 	if ignore_list != None or match_list != None:
-		for key in rc.keys():
+		for key in rc:
 			if ignore_list != None and in_list(ignore_list, key):
 				del(rc[key])
 			if match_list != None and not in_list(match_list, key):
@@ -303,20 +306,25 @@ def service_process_task(log, t):
 def init_master(cf, conf, tasks):
 	host_record_handlers = []
 	service_record_handlers = []
+	host_attach_handlers = []
+	service_attach_handlers = []
 	if 'checker' not in cf.child_modules:
-		cf.log.error("Checker block not set, moduler checker init master faild\n")
+		cf.log.error("Checker block not set, module checker init master faild\n")
 		return ZC_ERROR
 		
 	for m in cf.child_modules['checker']:
-		if m.ctx == None:
-			continue
-		if m.ctx.host_record != None:
-			host_record_handlers.append(m.ctx.host_record)
-	for m in cf.child_modules['checker']:
-		if m.ctx == None:
-			continue
-		if m.ctx.service_record!= None:
-			service_record_handlers.append(m.ctx.service_record)
+		if m.ctx != None:
+			if isinstance(m.ctx.host_attach_handlers, list):
+				host_attach_handlers += m.ctx.host_attach_handlers
+			if m.ctx.host_record != None:
+				host_record_handlers.append(m.ctx.host_record)
+			if isinstance(m.ctx.service_attach_handlers, list):
+				service_attach_handlers += m.ctx.service_attach_handlers
+			if m.ctx.service_record != None:
+				service_record_handlers.append(m.ctx.service_record)
+		if m.init_master != None:
+			if m.init_master(cf, conf, tasks) == ZC_ERROR:
+				return ZC_ERROR
 	ctx = conf['ctx']
 	for gconf in conf['groups']:
 		gctx = gconf['ctx']
@@ -326,36 +334,37 @@ def init_master(cf, conf, tasks):
 			hctx = hconf['ctx']
 			if 'disable' in hctx and hctx['disable']:
 				continue
-			t = CHECKER_DEF_HOST_INTERVAL
-			if 'host_interval' in hctx:
-				t = hctx['host_interval']
 			tasks.append(
 				{
-					'task_info' : '"%s|%s"' %(hconf['group'], hconf['host']),
+					'task_info' : 'ZBX_HOST %s|%s' %(hconf['group'], hconf['host']),
 					'service_task' : None,
 					'process_task' : host_process_task,
-					'interval' : t,
+					'interval' : hctx['host_interval'],
 					'record_handlers' : host_record_handlers,
 					'conf' : hconf,
 				})
+			for h in host_attach_handlers:
+				if h(cf.log, tasks, hconf) == ZC_ERROR:
+					return ZC_ERROR
 			for sconf in hconf['services']:
 				sctx = sconf['ctx']
 				if 'disable' in sctx and sctx['disable']:
 					continue
 				stype = sctx['type']
 				service_module = cf.child_modules['checker'][service_types[stype]]
-				t = CHECKER_DEF_SVC_INTERVAL
-				if 'service_interval' in sctx:
-					x = sctx['service_interval']
 				tasks.append(
 					{
-						'task_info' : '"%s|%s|%s" %s' %(sconf['group'], sconf['host'], sconf['service'], sconf['ctx']['type']),
+						'task_info' : 'ZBX_SVC %s|%s|%s %s' %(sconf['group'], sconf['host'], sconf['service'], sconf['ctx']['type']),
 						'service_task' : service_module.ctx.service_task,
 						'process_task' : service_process_task,
-						'interval' : t,
+						'interval' : sctx['service_interval'],
 						'record_handlers' : service_record_handlers,
 						'conf' : sconf
 					})
+				for h in service_attach_handlers:
+					if h(cf.log, trasks, sconf) == ZC_ERROR:
+						return ZC_ERROR
+
 	return ZC_OK
 
 commands = [
@@ -370,21 +379,21 @@ commands = [
 		name = 'host_group',
 		type = ZC_CHECKER_MAIN_CONF|ZC_CONF_DIRECT|ZC_CONF_BLOCK|ZC_CONF_TAKE1,
 		set = group_block,
-		describe = 'Host group',
+		describe = 'Host group block',
 		key = None,
 	),
 	zc_command(
 		name = 'host',
 		type = ZC_CHECKER_GROUP_CONF|ZC_CONF_DIRECT|ZC_CONF_BLOCK|ZC_CONF_TAKE1,
 		set = host_block,
-		describe = 'Host',
+		describe = 'Host block',
 		key = None,
 	),
 	zc_command(
 		name = 'service',
 		type = ZC_CHECKER_HOST_CONF|ZC_CONF_DIRECT|ZC_CONF_BLOCK|ZC_CONF_TAKE1,
 		set = service_block,
-		describe = 'Service',
+		describe = 'Service block',
 		key = None,
 	),
 	zc_command(
@@ -393,6 +402,13 @@ commands = [
 		set = zc_set_svc_type,
 		describe = 'Service type',
 		key = 'type',
+	),
+	zc_command(
+		name = 'custom_type_name',
+		type = ZC_CHECKER_SVC_CONF|ZC_CONF_DIRECT|ZC_CONF_TAKE1,
+		set = zc_conf_set_str_slot,
+		describe = 'Service custom type name',
+		key = 'custom_type',
 	),
 	zc_command(
 		name = 'host_interval',

@@ -33,7 +33,7 @@ def merge_service_conf(cf, parent, child):
 	stype = child['ctx']['type']
 	zc_dict_set_no_has(ctx, pctx, 'redis_port', 'redis_socket_timeout')
 	ctx['redis_port'] = zc_dict_get_gt(ctx, 'redis_port', 0, REDIS_DEF_PORT)
-	ctx['redis_socket_timeout'] = zc_dict_get_gt(ctx, 'redis_socket_timeout', 0, REDIS_DEF_SOCKET_TIMEOUT)
+	ctx['redis_socket_timeout'] = zc_dict_get_ge(ctx, 'redis_socket_timeout', 0, REDIS_DEF_SOCKET_TIMEOUT)
 	if stype in module.ctx.service_types:
 		if 'redis_host' not in ctx:
 			cf.log.warn('redis_host is not set in block "%s" will disabled "%s"in line %d in %s' %(child['service'], stype, child['start_line'], child['conf_file']))
@@ -48,7 +48,10 @@ def task_handler(log, task):
 	now = time.time()
 	status = {}
 	stype = conf['ctx']['type']
-	key_args = {'socket_timeout' : mctx['redis_socket_timeout']}
+	key_args = {}
+	timeout = int(mctx['redis_socket_timeout'])
+	if timeout > 0:
+		key_args['socket_timeout'] = timeout
 	args = {}
 	if 'redis_passwd' in mctx:
 		args['redis_passwd'] = mctx['redis_passwd']
@@ -64,16 +67,18 @@ def task_handler(log, task):
 	for k in info.keys():
 		if type(info[k]) == types.DictType:
 			for k2 in info[k].keys():
-				status["%s_%s" %(k,k2)] = info[k][k2]
+				status["%s_%s" %(k,k2)] = {'value': info[k][k2]}
 		else:
-			status[k] = info[k]
+			status[k] = {'value': info[k]}
 	use_time = time.time() - now
 	if len(status) == 0:
 		log.error('%s "%s:%d" %.6fs "can\'t get status"' %(task['task_info'], mctx['redis_host'], mctx['redis_port'], use_time))
 		return None
 	log.info('%s "%s:%d" %.6fs"' %(task['task_info'], mctx['redis_host'], mctx['redis_port'], use_time))
-	status['_check_use_time_'] = use_time
-	return status
+	r = []
+	for key in status:
+		r.append({'key' : key, 'value': status[key]})
+	return r
 
 commands = [
 	zc_command(

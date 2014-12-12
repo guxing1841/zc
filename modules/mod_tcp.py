@@ -31,7 +31,7 @@ def merge_service_conf(cf, parent, child):
 	pctx = parent['modules'][module.ctx_index]
 	stype = child['ctx']['type']
 	zc_dict_set_no_has(ctx, pctx, 'tcp_connect_timeout')
-	ctx['tcp_connect_timeout'] = zc_dict_get_gt(ctx, 'tcp_connect_timeout', 0, TCP_DEF_CONNECT_TIMEOUT)
+	ctx['tcp_connect_timeout'] = zc_dict_get_ge(ctx, 'tcp_connect_timeout', 0, TCP_DEF_CONNECT_TIMEOUT)
 	if stype in module.ctx.service_types:
 		if 'tcp_host' not in ctx:
 			cf.log.warn('tcp_host is not set in block "%s" will disabled "%s"in line %d in %s' %(child['service'], stype, child['start_line'], child['conf_file']))
@@ -48,8 +48,10 @@ def merge_service_conf(cf, parent, child):
 def task_handler(log, task):
 	conf = task['conf']
 	mctx = conf['modules'][module.ctx_index]
+	timeout = mctx['tcp_connect_timeout']
 	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	sock.settimeout(int(mctx['tcp_connect_timeout']))
+	if timeout > 0:
+		sock.settimeout(timeout)
 	now = time.time()
 	stype = conf['ctx']['type']
 	try:
@@ -58,11 +60,11 @@ def task_handler(log, task):
 		finally:
 			sock.close()
 			use_time = time.time() - now
-	except socket.error as e:
+	except socket.error, e:
 		log.error('%s "%s:%d" %.6fs %s' %(task['task_info'],  mctx['tcp_host'], mctx['tcp_port'], use_time, e))
 		return None
 	log.info('%s "%s:%d" %.6fs' %(task['task_info'], mctx['tcp_host'], mctx['tcp_port'], use_time))
-	return {'_check_use_time_': "%.6f" %(use_time)}
+	return [{'key' : 'conn_time', 'value': "%.6f" %(use_time)}]
 
 
 commands = [

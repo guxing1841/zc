@@ -16,7 +16,7 @@ ZC_CHECKER_HOST_TASK  = 1
 ZC_CHECKER_SVC_TASK  = 2
 
 
-class zc_checker_module_ctx():
+class zc_checker_module_ctx:
 	def __init__(self, **args):
 		self.service_types = None
 		self.service_record = None
@@ -26,6 +26,8 @@ class zc_checker_module_ctx():
 		self.merge_group_conf = None
 		self.merge_host_conf = None
 		self.merge_service_conf = None
+		self.host_attach_handlers = None
+		self.service_attach_handlers = None
 		for key in args.keys():
 			if key == 'service_types':
 				self.service_types = args[key]
@@ -43,6 +45,10 @@ class zc_checker_module_ctx():
 				self.merge_host_conf = args[key]
 			elif key == 'merge_service_conf':
 				self.merge_service_conf = args[key]
+			elif key == 'host_attach_handlers':
+				self.host_attach_handlers = args[key]
+			elif key == 'service_attach_handlers':
+				self.service_attach_handlers = args[key]
 			else:
 				raise TypeError, "zc_checker_module_ctx() got an unexpected keyword argument '%s'" %(key)
 				os._exit(1)

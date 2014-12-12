@@ -3,7 +3,7 @@ Minimum heap and maximum heap
 Copyright (C) Zhou Changrong
 """
 
-class heap_node():
+class heap_node:
 	def __init__(self, data = None):
 		self.index = -1
 		if data != None:
@@ -16,7 +16,7 @@ def RIGHT(i):
 	return 2*(i+1)
 def PARENT(i):
 	return (i+1)/2-1
-class heap():
+class heap:
 	def node(self, data = None):
 		"""node(data = None) -> heap_node object"""
 		return heap_node(data)
@@ -32,24 +32,30 @@ class heap():
 
 	def up(self, index):
 		node = self.heap[index]
+		if index == 0:
+			return 0
 		parent = PARENT(index)
+		ret = 0
 		while (index > 0 and self.compar(node.data, self.heap[parent].data) < 0):
 			self.heap[index] = self.heap[parent]
 			self.heap[index].index = index
 			index = parent
 			parent = PARENT(index)
+			ret += 1
 		node.index = index
 		self.heap[index] = node
+		return ret
 
 	def down(self, index):
 		node = self.heap[index]
+		ret = 0
 		last_index = self.last_index;
 		while True:
 			left = LEFT(index)
 			right = RIGHT(index)
 			if (left > last_index):
-				break
-			elif (right == last_index or self.compar(self.heap[left].data, self.heap[right].data) <= 0):
+				break;
+			if (left == last_index or self.compar(self.heap[left].data, self.heap[right].data) <= 0):
 				min = left
 			else:
 				min = right
@@ -58,6 +64,7 @@ class heap():
 			self.heap[min].index = index
 			self.heap[index] = self.heap[min]
 			index = min
+			ret += 1
 		node.index = index
 		self.heap[index] = node
 
@@ -76,19 +83,21 @@ Insert a heap_node object to heap"""
 	def delete(self, node):
 		"""delete(node) -> bool
 Delete a heap_node object from heap"""
-
 		index = node.index
 		last_index = self.last_index
 		if (index < 0 or last_index < 0 or index > last_index):
 			return False
 		if (self.heap[index] != node):
 			return False
-		self.last_index -= 1
 		if index != last_index:
+			count = 0
 			self.heap[index] = self.heap[last_index]
 			self.heap[index].index = index
-			self.up(index)
-			self.down(index)
+			if index != 0:
+				count = self.up(index)
+			if count == 0:
+				self.down(index)
+		self.last_index -= 1
 		node.index = -1
 		self.heap[last_index] = None
 		return True

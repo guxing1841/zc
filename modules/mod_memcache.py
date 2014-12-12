@@ -33,11 +33,11 @@ def merge_service_conf(cf, parent, child):
 	pctx = parent['modules'][module.ctx_index]
 	stype = child['ctx']['type']
 	zc_dict_set_no_has(ctx, pctx, 'mc_port', 'mc_socket_timeout')
-	ctx['mc_socket_timeout'] = zc_dict_get_gt(ctx, 'mc_socket_timeout', 0, MC_DEF_SOCKET_TIMEOUT)
+	ctx['mc_socket_timeout'] = zc_dict_get_ge(ctx, 'mc_socket_timeout', 0, MC_DEF_SOCKET_TIMEOUT)
 	if stype == 'memcache':
-		ctx['mc_socket_timeout'] = zc_dict_get_gt(ctx, 'mc_socket_timeout', 0, MC_DEF_PORT)
+		ctx['mc_port'] = zc_dict_get_gt(ctx, 'mc_port', 0, MC_DEF_PORT)
 	elif stype == 'ttserver':
-		ctx['mc_socket_timeout'] = zc_dict_get_gt(ctx, 'mc_socket_timeout', 0, TS_DEF_PORT)
+		ctx['mc_port'] = zc_dict_get_gt(ctx, 'mc_port', 0, TS_DEF_PORT)
 	return ZC_OK
 
 
@@ -49,8 +49,9 @@ def task_handler(log, task):
 	status = {}
 	stype = conf['ctx']['type']
 	key_args = {'debug' : 0}
-	if memcache.__version__ >= '1.48':
-		key_args['socket_timeout'] = mctx['mc_socket_timeout']
+	timeout = int(mctx['mc_socket_timeout'])
+	if memcache.__version__ >= '1.48' and timeout > 0:
+		key_args['socket_timeout'] = timeout
 	conn = memcache.Client(["%s:%d" %(mctx['mc_host'], mctx['mc_port'])], **key_args)
 	status = conn.get_stats()
 	conn.disconnect_all()
@@ -61,8 +62,10 @@ def task_handler(log, task):
 	status = status[0][1]
 	use_time = time.time() - now
 	log.info('%s "%s:%d" %.6fs"' %(task['task_info'], mctx['mc_host'], mctx['mc_port'], use_time))
-	status['_check_use_time_'] = use_time
-	return status
+	r = []
+	for key in status:
+		r.append({'key' : key, 'value': status[key]})
+	return r
 
 commands = [
 	zc_command(

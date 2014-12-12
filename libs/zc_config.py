@@ -30,6 +30,14 @@ commands = [
 		describe = 'Define a variable',
 		key = 'sets'
 	),
+	zc_command(
+		name = 'disable',
+		type = ZC_ANY_CONF|ZC_CONF_DIRECT|ZC_CONF_TAKE1,
+		set = zc_conf_set_flag_slot,
+		describe = 'Disable',
+		key = 'disable'
+	),
+
 ]
 
 module = zc_module(

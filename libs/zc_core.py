@@ -2,8 +2,13 @@
 Core module
 Copyright (C) Zhou Changrong
 """
-import os, sys, getopt, logging, socket, struct, signal, time, select, errno, ctypes, random, fcntl, pwd, grp
-from setproctitle import setproctitle,getproctitle
+import os, sys, getopt, logging, socket, struct, signal, time, select, errno, random, fcntl, pwd, grp
+import zc_log
+try:
+	#from setproctitle import setproctitle,getproctitle
+	import setproctitle as spt
+except:
+	spt = None
 from zc_common import *
 import heap
 from zc_config_h import *
@@ -15,23 +20,31 @@ ZC_DEF_MAXWORKERS       = 20
 ZC_DEF_STARTWORKERS     = 5
 ZC_DEF_MINSPAREWORKERS  = 5
 ZC_DEF_MAXSPAREWORKERS  = 25
+ZC_DEF_COUNT_INTERVAL   = 300
 ZC_DEF_LOGFILE = 'logs/zc.log'
-ZC_DEF_LOGLEVEL = logging.INFO
+#ZC_DEF_LOGLEVEL = logging.INFO
+ZC_DEF_LOGLEVEL = zc_log.INFO
 #ZC_DEF_LOGLEVEL = logging.DEBUG
 ZC_DEF_PIDFILE = 'logs/zc.pid'
 action = None
+POLLOUT = 0
+POLLIN = 0
+POLLREAD = 0
+POLLWRITE = 0
 
 progname = 'zc'
 tasks = None
-quene = None
+queue = None
 script_dir = None
 processes = None
-processeshash = None
-old_processes = None
-old_processes_hash = None
+processes_hash = None
+processes_fds = None
+old_processes_hash = {}
+old_processes_fds = {}
 num_processes = 0
+prepare_processes = 0
 spare_processes = None
-daemon = False
+daemon = True
 shutdown = False
 debug = False
 reconfigure = False
@@ -46,27 +59,72 @@ cwd = os.getcwd()
 ZC_BASEDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 module_dir = ZC_BASEDIR + '/modules'
 sys.path.insert(0, module_dir)
+class zc_events_poll:
+	def __init__(self):
+		self.POLLIN = select.POLLIN
+		self.POLLOUT = select.POLLOUT
+		self.p = select.poll()
+	def register(self, fd, mask):
+		return self.p.register(fd, mask)
+	def modify(self, fd, mask):
+		return self.p.register(fd, mask)
+	def unregister(self, fd):
+		return self.p.unregister(fd)
+	def poll(self, timeout):
+		return self.p.poll(timeout*1000)
+	def close(self):
+		return self.p.close()
+
+class zc_events_epoll:
+	et = True
+	maxevents = -1
+	def __init__(self, **kwargs):
+		self.POLLIN = select.EPOLLIN
+		self.POLLOUT = select.EPOLLOUT
+		self.p = select.epoll()
+		for key in kwargs:
+			if key == 'et':
+				self.et = kwargs[key]
+			elif key == 'maxevents':
+				self.maxevents = kwargs[key]
+	def register(self, fd, mask):
+		if self.et:
+			mask |= select.EPOLLET
+		return self.p.register(fd, mask)
+	def modify(self, fd, mask):
+		if self.et:
+			mask |= select.EPOLLET
+		return self.p.modify(fd, mask)
+	def unregister(self, fd):
+		return self.p.unregister(fd)
+	def poll(self, timeout):
+		return self.p.poll(timeout, self.maxevents)
+	def close(self):
+		return self.p.close()
+	
+		
+
+def setproctitle(*args):
+	if spt == None:
+		return True
+	return spt.setproctitle(*args)
+def getproctitle(*args):
+	if spt == None:
+		return sys.argv[0]
+	return spt.getproctitle(*args)
 
 def zc_master_signal(a, b):
 	global shutdown,reconfigure, reopen
 	if a in (signal.SIGTERM, signal.SIGINT):
-		if not shutdown:
-			os.kill(0, signal.SIGTERM)
 		shutdown = True
 	elif a == signal.SIGHUP:
-		if not reconfigure:
-			os.kill(0, signal.SIGHUP)
 		reconfigure = True
 	elif a == signal.SIGUSR1:
-		if not reopen:
-			os.kill(0, signal.SIGUSR1)
 		reopen = True
 
 def zc_worker_signal(a, b):
-	global shutdown,reconfigure
-	if a in (signal.SIGTERM, signal.SIGINT):
-		shutdown = True
-	elif a == signal.SIGHUP:
+	global reconfigure, reopen
+	if a == signal.SIGHUP:
 		reconfigure = True
 	elif a == signal.SIGUSR1:
 		reopen = True
@@ -101,7 +159,7 @@ def load_module(cf, name):
 		return ZC_ERROR
 	return ZC_OK
 def unload_module(cf, name):
-	cf.log.info("Unload module mod_%s" %(name))
+	cf.log.debug("Unload module mod_%s" %(name))
 	del sys.modules["mod_%s" %(name)]
 	return ZC_OK
 
@@ -193,6 +251,13 @@ commands = [
 		key = 'startworkers',
 		),
 	zc_command(
+		name = 'count_interval',
+		type = ZC_MAIN_CONF|ZC_CONF_DIRECT|ZC_CONF_TAKE1,
+		set = zc_conf_set_sec_slot,
+		describe = 'Count interval',
+		key = 'count_interval',
+		),
+	zc_command(
 		name = 'use',
 		type = ZC_MAIN_CONF|ZC_CONF_DIRECT|ZC_CONF_TAKE1,
 		set = zc_conf_set_use_slot,
@@ -211,58 +276,75 @@ module = zc_module(
 	)
 
 def usage():
-	print "Usage: %s [OPTIONS...] <start|stop|reload|reopen|restart>" %(sys.argv[0])
-	print
-	print "Options:"
-	print " -c/--config-file <path> Config file"
-	print " -d/--debug         Show debug message"
-	print " -D/--daemon        Daemon"
-	print " -h/--help          Display this page and exit"
-	print " -v/--version       Display version and exit"
+	print("Usage: %s [OPTIONS...] <start|stop|reload|reopen|check|restart>" %(sys.argv[0]))
+	print("")
+	print("Options:")
+	print(" -c/--config-file <path> Config file")
+	print(" -d/--debug         Show debug message")
+	print(" -N/--nodaemon      Not start daemon mode")
+	print(" -h/--help          Display this page and exit")
+	print(" -v/--version       Display version and exit")
 
-def process_size():
-	return struct.calcsize('iii')
+def task_size():
+	return struct.calcsize('i')
 
-def pack_process(process):
-	s = struct.pack('iii', process['id'], process['pid'], process['task_id'])
+def pack_task(task_id):
+	s = struct.pack('i', task_id)
 	return s
 
-def unpack_process(s):
-	process = {}
-	process['id'], process['pid'], process['task_id'] = struct.unpack('iii', s)
-	return process
+def unpack_task(s):
+	task_id = struct.unpack('i', s)[0]
+	return task_id
 
 def process_cycle(log, process):
-	global tasks, reconfigure, reload, shutdown
+	global tasks, reconfigure, reopen, debug
 	p = process['channel']
+	setproctitle('%s: worker process %5d' %(progname, process['id']))
 	while True:
-		setproctitle('%s: worker process %5d (spare)' %(progname, process['id']))
-		if reconfigure or reopen:
+
+		#setproctitle('%s: worker process %5d (spare)' %(progname, process['id']))
+		if reconfigure:
 			os._exit(0)
-		if shutdown:
-			os._exit(0)
+		if reopen:
+			try:
+				log.reopen()
+			except zc_log.error, e:
+				log.error("%s" %(e))
+				os._exit(1)
+			if not debug:
+				sys.stderr = log.handlers[0].stream
+				sys.stdout = log.handlers[0].stream
+			reopen = False
+			log.debug("work reopened")
+		length = task_size()
 		try:
-			os.write(p[1].fileno(), pack_process(process))
-			length = process_size()
 			buf = os.read(p[1].fileno(), length)
-			setproctitle('%s: worker process %5d (busy)' %(progname, process['id']))
+			#setproctitle('%s: worker process %5d (busy)' %(progname, process['id']))
 		except OSError, e:
-			if shutdown:
-				os._exit(0)
-			os._exit(1)
-		if shutdown:
-			os._exit(0)
-		tmp = unpack_process(buf)
-		process['task_id'] = tmp['task_id']
-		task = tasks[process['task_id']]
+			if e.errno != errno.EINTR:
+				log.error("%s" %(e))
+				os._exit(1)
+		if reopen or reconfigure:
+			continue
+		task_id = unpack_task(buf)
+		process['task_id'] = task_id
+		task = tasks[task_id]
 		task['process_task'](log, task)
+		if reopen or reconfigure:
+			continue
+		try:
+			os.write(p[1].fileno(), pack_task(task_id))
+		except OSError, e:
+			if e.errno != errno.EINTR:
+				os._exit(1)
+
 
 def cmp_handler(a, b):
 	return cmp(a['next_time'], b['next_time'])
 
 def set_worker_signal():
-	signal.signal(signal.SIGINT, zc_worker_signal)
-	signal.signal(signal.SIGTERM, zc_worker_signal)
+	signal.signal(signal.SIGINT, signal.SIG_DFL)
+	signal.signal(signal.SIGTERM, signal.SIG_DFL)
 	signal.signal(signal.SIGPIPE, zc_worker_signal)
 	signal.signal(signal.SIGHUP, zc_worker_signal)
 	signal.signal(signal.SIGUSR1, zc_worker_signal)
@@ -271,7 +353,7 @@ def set_worker_signal():
 
 
 def start_worker_process(cf, id=-1):
-	global tasks, processes, processes_hash, num_processes, poll
+	global tasks, processes, processes_hash, num_processes, prepare_processes, poll
 	ctx = cf.conf['ctx']
 	if id < 0:
 		s = 0
@@ -281,6 +363,7 @@ def start_worker_process(cf, id=-1):
 			s+=1
 	else:
 		s = id
+	process = processes[s]
 	pid = os.getpid()
 	p = socket.socketpair()
 	pfd = [p[0].fileno(), p[1].fileno()]
@@ -289,8 +372,8 @@ def start_worker_process(cf, id=-1):
 	flags = fcntl.fcntl(pfd[1], fcntl.F_GETFD)
 	fcntl.fcntl(pfd[1], fcntl.F_SETFD, flags|fcntl.FD_CLOEXEC)
 	fcntl.fcntl(pfd[1], fcntl.F_SETOWN, pid)
-	processes[s]['id'] = s
-	processes[s]['channel'] = p
+	process['id'] = s
+	process['channel'] = p
 	try:
 		pid = os.fork()
 	except OSError, e:
@@ -298,8 +381,8 @@ def start_worker_process(cf, id=-1):
 		return None
 	if pid == 0:
 		pid = os.getpid()
-		processes[s]['pid'] = pid
-		processes[s]['task_id'] = -1
+		process['pid'] = pid
+		process['task_id'] = -1
 		p[0].close()
 		euid = os.geteuid()
 		if euid == 0:
@@ -310,61 +393,72 @@ def start_worker_process(cf, id=-1):
 
 		set_worker_signal()
 		setproctitle('%s: worker process %5d (prepare)' %(progname, s))
-		process_cycle(cf.log, processes[s])
+		process_cycle(cf.log, process)
 		os._exit(0)
 	else:
-		processes[s]['pid'] = pid
+		fd = pfd[0]
+		process['pid'] = pid
 		processes_hash[pid] = s
-		processes[s]['task_id'] = -1
+		processes_fds[fd] = s
+		process['task_id'] = -1
 		p[1].close()
-		processes[s]['status'] = ZC_PREPARE
+		process['status'] = ZC_PREPARE
 		num_processes += 1
-	return processes[s]
+		prepare_processes += 1
+		poll.register(fd, poll.POLLOUT)
+	return process
 
 
 def wait_process(cf):
-	global processes,num_processes, processes_hash, spare_processes, old_processes_hash, shutdown, reconfigure, tasks, quene
+	global processes, num_processes, prepare_processes, processes_hash, processes_fds, spare_processes, old_processes_hash, shutdown, reconfigure, tasks, queue
 	try:
 		pid, status = os.waitpid(0, os.WNOHANG)
 	except OSError, e:
 		return -1
 	if pid == 0:
 		return 0
-	cf.log.info('Pid %d exit with status %d' %(pid, status))
-	if old_processes_hash != None and pid in old_processes_hash:
+	cf.log.warn('Pid %d exit with status %d' %(pid, os.WEXITSTATUS(status)))
+	if pid in old_processes_hash:
 		# free process data and close channel
 		del old_processes_hash[pid]
-		if len(old_processes_hash) == 0:
-			old_processes_hash = None
+		return pid
+	if pid not in processes_hash:
 		return pid
 	num_processes -= 1
 	id = processes_hash[pid]
 	process = processes[id]
+	fd = process['channel'][0].fileno()
 	if process['status'] == ZC_SPARE:
 		spare_processes.remove(process)
 	elif process['status'] == ZC_BUSY:
 		# epoll is not need unregister fd, cause it to be removed from all epoll sets automatically
-		poll.unregister(process['channel'][0].fileno())
+		poll.unregister(fd)
 		now = time.time()
-		node = quene.node()
+		node = queue.node()
 		node.data = {'next_time': now + tasks[process['task_id']]['interval'], 'task_id': process['task_id']}
-		quene.insert(node)
-	# close and free channel
-	processes[id]['channel'] = None
-	processes[id]['pid'] = -1
+		queue.insert(node)
+	elif process['status'] == ZC_PREPARE:
+		prepare_processes -= 1
 	del processes_hash[pid]
+	del processes_fds[fd]
+	# close and free channel
+	process['channel'] = None
+	process['pid'] = -1
 	return pid
 	
 	
 	
 
-def create_daemon():
-	pid = os.fork()
-	if pid == -1:
+def create_daemon(cf):
+	try:
+		pid = os.fork()
+	except OSError, e:
+		cf.log.error("Can't fork: %s" %e)
 		os._exit(1)
 	if pid > 0:
 		os._exit(0)
 	os.setsid()
+	
 
 def start_worker_processes(cf):
 	global processes, spare_processes, tasks
@@ -375,8 +469,6 @@ def start_worker_processes(cf):
 		process = start_worker_process(cf, id)
 		if process == None:
 			break
-		process['status'] = ZC_SPARE
-		spare_processes.append(process)
 		id+=1
 
 def set_master_signal():
@@ -395,19 +487,21 @@ def set_master_signal2():
 
 
 def event_cycle(cf):
-	global reconfigure, shutdown, reopen, poll, poll_type, spare_processes, processes, num_processes, processes_hash, old_processes_hash, quene
+	global reconfigure, shutdown, reopen, poll, poll_type, spare_processes, processes, num_processes, prepare_processes, processes_fds, processes_hash, old_processes_hash, queue, debug
 	ctx = cf.conf['ctx']
-	quene = heap.heap(128, cmp_handler)
+	queue = heap.heap(128, cmp_handler)
 	i = 0
 	spare_processes = []
 	processes = []
 	processes_hash = {}
+	processes_fds = {}
 	num_processes = 0
+	prepare_processes = 0
 	now = time.time()
 	for t in tasks:
-		node = quene.node()
+		node = queue.node()
 		node.data = {'next_time': now + random.uniform(0, t['interval']), 'task_id': i}
-		quene.insert(node)
+		queue.insert(node)
 		i += 1
 	s = 0
 	while s < ctx['maxworkers']:
@@ -418,47 +512,85 @@ def event_cycle(cf):
 	start_worker_processes(cf)
 	rc = None
 	increase_times = 0
-	change_time = time.time()
 	decrease_times = 0
-	last_count_time = time.time()
+	killed = False
+	count_interval = ctx['count_interval']
+	start_time = time.time()
+	last_count_time = start_time
+	change_time = start_time
 	do_tasks = 0
+	last_do_tasks = 0
 	while True:
 		wait_process(cf)
 		if shutdown:
-			if num_processes == 0:
+			if num_processes == 0 and len(old_processes_hash) == 0:
 				break
-			time.sleep(0.001)
+			time.sleep(0.1)
+			if not killed:
+				for pid in processes_hash:
+					os.kill(pid, signal.SIGTERM)
+				for pid in old_processes_hash:
+					os.kill(pid, signal.SIGTERM)
+				killed = True
 			continue
-		if reconfigure or reopen:
-			old_processes_hash = processes_hash
+		if reconfigure:
+			time.sleep(0.1)
+			sig = signal.SIGHUP
+			for pid in processes_hash:
+				os.kill(pid, sig)
+			for pid in processes_hash:
+				old_processes_hash[pid] = processes_hash[pid]
 			set_master_signal2()
 			break
+		if reopen:
+			cf.log.all("Reopen log file")
+			try:
+				cf.log.reopen(ctx['user'])
+			except error, e:
+				cf.log.error("%s" %(e))
+				shutdown = True
+				continue
+			if not debug:
+				sys.stderr = cf.log.handlers[0].stream
+				sys.stdout = cf.log.handlers[0].stream
+			cf.log.debug("master reopened")
+			sig = signal.SIGUSR1
+			for pid in processes_hash:
+				os.kill(pid, sig)
+			reopen = False
 		now = time.time()
-		s = quene.top()
+		s = queue.top()
 		while s != None and s.data['next_time'] <= now and len(spare_processes) > 0:
-			quene.delete(s)
-			process = spare_processes.pop()
+			if shutdown or reconfigure or reopen:
+				break
+			process = spare_processes[-1]
 			process['task_id'] = s.data['task_id']
 			fd = process['channel'][0].fileno()
 			delay = now - s.data['next_time']
 			if delay > 1:
-				cf.log.warn('start delay %f, quene busy' %(delay))
-			cf.log.debug("Send process info to fd %d" %(fd))
+				cf.log.warn('start delay %f, queue busy' %(delay))
+			cf.log.debug("Send to fd %d" %(fd))
 			try:
-				fd_send(fd, pack_process(process))
+				fd_send(fd, pack_task(process['task_id']))
 			except ZC_Error, e:
+				if e[0] == errno.EINTR:
+					continue
 				# SIG_PIPE
-				cf.log.error("Send process info to %d: %s" %(fd, e))
+				cf.log.error("Send to %d: %s" %(fd, e))
 				process['status'] = ZC_PREPARE
+				prepare_processes += 1
+				spare_processes.pop()
 				continue
-			cf.log.debug("poll regiser %d" %(fd))
+			cf.log.debug("Poll regiser %d" %(fd))
+			poll.register(fd, poll.POLLIN)
 			tasks[process['task_id']]['last_time'] = s.data['next_time']
-			poll.register(fd, select.EPOLLIN|select.EPOLLET)
 			process['status'] = ZC_BUSY
-			s = quene.top()
-		timeout = 0.5
+			spare_processes.pop()
+			queue.delete(s)
+			s = queue.top()
+		timeout = 0.05
 		if (len(spare_processes) > 0):
-			s = quene.top()
+			s = queue.top()
 			if s != None:
 				now = time.time()
 				delta = s.data['next_time'] - now
@@ -466,28 +598,23 @@ def event_cycle(cf):
 					delta = 0
 				if delta < timeout:
 					timeout = delta
-		if poll_type == 'epoll':
-			try:
-				rc = poll.poll(timeout)
-			except IOError, e:
-				if e.errno == errno.EINTR:
-					continue
-				cf.log.error("poll %d %s" %(e.errno, e.strerror))
-				shutdown = True
+		try:
+			rc = poll.poll(timeout)
+		except select.error, e:
+			if e[0] == errno.EINTR:
 				continue
-		else:
+			cf.log.error("poll %d %s" %(e[0], e[1]))
+			shutdown = True
+			continue
+		except IOError, e:
+			if e.errno == errno.EINTR:
+				continue
+			cf.log.error("poll %d %s" %(e.errno, e.strerror))
+			shutdown = True
+			continue
 
-			timeout *= 1000
-			try:
-				rc = poll.poll(timeout)
-			except select.error, e:
-				if e[0] == errno.EINTR:
-					continue
-				cf.log.error("poll %d %s" %(e.errno, e.strerror))
-				shutdown = True
-				continue
-		num_spare_processes = len(spare_processes)
-		if (num_processes > ctx['startworkers']) and (num_processes >= ctx['startworkers']) and (num_spare_processes > ctx['maxspareworkers']):
+		num_spare_processes = len(spare_processes) + prepare_processes
+		if (num_processes > ctx['maxworkers']) or (num_processes > ctx['startworkers']) and (num_spare_processes > ctx['maxspareworkers']):
 			increase_times = 0
 			now = time.time()
 			if change_time <= now-1:
@@ -498,23 +625,24 @@ def event_cycle(cf):
 				if max_decreases > 0:
 					i = 0
 					while True:
-						if i >= max_decrease:
+						if i >= max_decreases:
 							break
 						x = decrease_times
 						if x >= 4:
 							x = 4
 						if i >= 2**x:
 							break
-						process = spare_processes.pop()
-						process['status'] = ZC_PREPARE
+						process = spare_processes[-1]
 						cf.log.debug("kill pid %d(SIGTTERM)" %(process['pid']))
 						os.kill(process['pid'], signal.SIGTERM)
+						prepare_processes+=1
+						process['status'] = ZC_PREPARE
+						spare_processes.pop()
 						i += 1
 					if i>=max_decreases:
 						decrease_times = 0
 					change_time = time.time()
-					if decrease_times < 4:
-						decrease_times += 1
+					decrease_times += 1
 		elif (num_processes < ctx['startworkers']) or (num_processes < ctx['maxworkers']) and (num_spare_processes < ctx['minspareworkers']):
 			decrease_times = 0
 			now = time.time()
@@ -533,7 +661,7 @@ def event_cycle(cf):
 				if max_increases > 0:
 					i = 0
 					while True:
-						if i >= max_increase:
+						if i >= max_increases:
 							break
 						x = increase_times
 						if x >= 4:
@@ -541,8 +669,6 @@ def event_cycle(cf):
 						if i >= 2**x:
 							break
 						process = start_worker_process(cf)
-						process['status'] = ZC_SPARE
-						spare_processes.append(process)
 						i += 1
 					if i>=max_increases:
 						increase_times = 0
@@ -551,12 +677,14 @@ def event_cycle(cf):
 		else:
 			increase_times = 0
 			decrease_times = 0
-		if cf.log.getEffectiveLevel() <= logging.INFO:		
-			now = time.time()
-			if (now >= last_count_time+5):
-				cf.log.info("Do tasks %f/sec" %(float(do_tasks)/5))
-				last_count_time = now
-				do_tasks = 0
+
+		#if cf.log.getEffectiveLevel() <= logging.INFO:		
+		#if cf.log.getEffectiveLevel() <= zc_log.INFO:		
+		now = time.time()
+		if (now >= last_count_time+count_interval):
+			cf.log.all("Do tasks %d(%f/sec, %f/sec)" %(do_tasks, float(do_tasks-last_do_tasks)/count_interval, float(do_tasks)/(now-start_time)))
+			last_count_time = now
+			last_do_tasks = do_tasks
 		if rc == None:
 			continue
 		if shutdown or reconfigure:
@@ -564,42 +692,66 @@ def event_cycle(cf):
 		for fd, status in rc:
 			if shutdown or reconfigure:
 				break
-			if status  & select.POLLIN:
-				cf.log.debug("Recv process info from fd %d" %(fd))
+			if status & poll.POLLIN:
+				cf.log.debug("Recv from fd %d" %(fd))
+				r_len = task_size()
 				try:
-					r_len = process_size()
 					s = fd_recv(fd, r_len)
-					if len(s) != r_len:
-						cf.log.debug('fd %d was client abort' %(fd))
-						continue
 				except ZC_Error, e:
-					# No error here
-					cf.log.error("Recv process info from fd: %s" %(e))
+					if e[0] == errno.EINTR:
+						continue
+					cf.log.error("Recv from fd: %s" %(e))
 					continue
-				process = unpack_process(s)
-				process = processes[process['id']]
+				if len(s) != r_len:
+					cf.log.debug('fd %d was client abort' %(fd))
+					continue
+				task_id = unpack_task(s)
+				process = processes[processes_fds[fd]]
 				now = time.time()
-				node = quene.node()
-				last_time = tasks[process['task_id']]['last_time']
-				interval =  tasks[process['task_id']]['interval']
-				next_time = now
-				delta = interval-(now-last_time)
-				if delta > 0:
-					next_time += delta
-				elif delta < 0:
-					cf.log.warn('%s %s "task is too slow or service interval is too small(%f)"' %(str(tasks[process['task_id']]['task_info']), now-last_time, delta))
+				node = queue.node()
+				last_time = tasks[task_id]['last_time']
+				interval =  tasks[task_id]['interval']
+				next_time = now + interval
+				#delta = interval-(now-last_time)
+				#if delta > 0:
+				#	next_time = now + delta
+				#elif delta < 0:
+				#	cf.log.warn('%s %s "task is too slow or service interval is too small(%f)"' %(str(tasks[process['task_id']]['task_info']), now-last_time, delta))
 				node.data = {'next_time': next_time, 'task_id': process['task_id']}
-				quene.insert(node)
+				queue.insert(node)
 				do_tasks += 1
-				cf.log.debug("poll unregiser %d" %(fd))
+				poll.modify(fd, poll.POLLOUT)
+			elif status & poll.POLLOUT:
+				process = processes[processes_fds[fd]]
+				if process['status'] == ZC_PREPARE:
+					prepare_processes -= 1
+				s = queue.top()
+				if s != None and s.data['next_time'] <= now:
+					process['task_id'] = s.data['task_id']
+					fd = process['channel'][0].fileno()
+					delay = now - s.data['next_time']
+					if delay > 1:
+						cf.log.warn('start delay %f, queue busy' %(delay))
+					cf.log.debug("Send to fd %d" %(fd))
+					try:
+						fd_send(fd, pack_task(process['task_id']))
+					except ZC_Error, e:
+						if e[0] == errno.EINTR:
+							continue
+						# SIG_PIPE
+						cf.log.error("Send to %d: %s" %(fd, e))
+						process['status'] = ZC_PREPARE
+						prepare_processes += 1
+						continue
+					cf.log.debug("Poll regiser %d" %(fd))
+					poll.modify(fd, poll.POLLIN)
+					tasks[process['task_id']]['last_time'] = s.data['next_time']
+					process['status'] = ZC_BUSY
+					queue.delete(s)
+					continue
 				poll.unregister(fd)
 				process['status'] = ZC_SPARE
 				spare_processes.append(process)
-			if shutdown or reconfigure or reopen:
-				break
-		else:
-			continue
-		
 	return
 
 
@@ -607,19 +759,19 @@ def event_cycle(cf):
 def parse_args():
 	global config_file, daemon, debug, action
 	try:  
-		opts,args = getopt.gnu_getopt(sys.argv[1:], "c:dDhv", ["config-file=", "debug", "daemon", "help", "version"])
+		opts,args = getopt.gnu_getopt(sys.argv[1:], "c:dNhv", ["config-file=", "debug", "nodaemon", "help", "version"])
 		for opt,arg in opts:
 			if opt in ("-c", "--config-file"):
 				config_file = os.path.abspath(arg)
 			elif opt in ("-h", "--help"):
 				usage()
 				os._exit(0)
-			elif opt in ("-D", "--daemon"):
-				daemon = True
+			elif opt in ("-N", "--nodaemon"):
+				daemon = False
 			elif opt in ("-d", "--debug"):
 				debug = True
 			elif opt in ("-v", "--version"):
-				print ZC_VERSION
+				print(ZC_VERSION)
 				os._exit(0)
 	except getopt.GetoptError, e:
 		sys.stderr.write("Error: %s\n" %(e))
@@ -632,7 +784,7 @@ def parse_args():
 		sys.stderr.write("Error: Too few arguemnts\n")
 		usage()
 		os._exit(1)
-	if args[0] not in ('start', 'stop', 'reload', 'restart', 'check'):
+	if args[0] not in ('start', 'stop', 'reload', 'reopen', 'restart', 'check'):
 		sys.stderr.write("Unkown action: '%s'\n" %(args[0]))
 		usage()
 		os._exit(1)
@@ -640,6 +792,7 @@ def parse_args():
 
 def master_process():
 	global reconfigure, reopen, tasks, poll, poll_type, action
+	global POLLREAD, POLLWRITE, POLLIN, POLLOUT
 	logfh = None
 	oldlogfh = None
 	loghandler = None
@@ -654,140 +807,138 @@ def master_process():
 			for m in cf.modules:
 				if m.name not in ('config', 'core'):
 					unload_module(cf, m.name) 
-		if not reopen:
-			tasks = []
-			cf = zc_conf_file()
-			stderr_handler = None
-			if reconfigure:
-				cf.log = log
-			else:
-				cf.log = logging.getLogger()
-				cf.log.setLevel(ZC_DEF_LOGLEVEL)
-				stderr_handler=logging.StreamHandler(sys.stderr)
-				formatter = logging.Formatter("%(levelname)s:  %(message)s")
-				stderr_handler.setFormatter(formatter)
-				cf.log.addHandler(stderr_handler)
-			cf.conf = {
-				'modules' : [],
-				'ctx' : {
-					'defines' : {},
-					},
-				}
-			cf.main_conf = cf.conf
-			mod = sys.modules[__name__]
-			register_module(cf, mod)
-			register_module(cf, zc_config)
-			sys.path.insert(0, module_dir)
-			if cf.file_parser(config_file) == ZC_ERROR:
-				if action == 'check':
-					cf.log.error('Check failed')
-				os._exit(1)
+		tasks = []
+		cf = zc_conf_file()
+		stderr_handler = None
+		if reconfigure:
+			cf.log = log
+		else:
+			cf.log = zc_log.logging()
+			cf.log.setLevel(ZC_DEF_LOGLEVEL)
+			stderr_handler=zc_log.Handler(stream=sys.stderr, format="%(levelname)s - [%(process)d]:  %(message)s")
+			cf.log.addHandler(stderr_handler)
+		cf.conf = {
+			'modules' : [],
+			'ctx' : {
+				'defines' : {},
+				},
+			}
+		cf.main_conf = cf.conf
+		mod = sys.modules[__name__]
+		register_module(cf, mod)
+		register_module(cf, zc_config)
+		sys.path.insert(0, module_dir)
+		if cf.file_parser(config_file) == ZC_ERROR:
 			if action == 'check':
-				cf.log.info('Check ok')
-				os._exit(0)
-			ctx = cf.conf['ctx']
-			ctx['maxworkers'] = zc_dict_get_ge(ctx, 'maxworkers', 0, ZC_DEF_MAXWORKERS)
-			ctx['startworkers'] = zc_dict_get_ge(ctx, 'startworkers', 0, ZC_DEF_STARTWORKERS)
-			ctx['minspareworkers'] = zc_dict_get_ge(ctx, 'minspareworkers', 0, ZC_DEF_MINSPAREWORKERS)
-			ctx['maxspareworkers'] = zc_dict_get_ge(ctx, 'maxspareworkers', 0, ZC_DEF_MAXSPAREWORKERS)
-			ctx['logfile'] = ctx.get('logfile', ZC_DEF_LOGFILE)
-			ctx['loglevel'] = ctx.get('loglevel', ZC_DEF_LOGLEVEL)
-			ctx['user'] = ctx.get('user')
-			ctx['group'] = ctx.get('group')
-			ctx['pidfile'] = ctx.get('pidfile', ZC_DEF_PIDFILE)
-			if ctx['user'] != None:
-				pw = pwd.getpwnam(ctx['user'])
-				ctx['user'] = pw.pw_uid
-			if ctx['group'] != None:
-				gr = grp.getgrnam(ctx['group'])
-				ctx['group'] = gr.gr_gid
-			if ctx['maxworkers'] < 1:
-				cf.log.error("Number maxwokers can't less than 1")
-				os._exit(1)
-			if ctx['minspareworkers'] < 0 or ctx['maxspareworkers'] < 0:
-				cf.log.error("Number minspareworkers or maxspareworkers can't less than 0")
-				os._exit(1)
-				
-			if ctx['startworkers'] > ctx['maxworkers']:
-				cf.log.warn("Startworkers %d is great than maxworkers %d, change startworkers to %d" %(ctx['startworkers'], ctx['maxworkers'], ctx['maxworkers']))
-				ctx['startworkers'] = ctx['maxworkers']
-			if ctx['minspareworkers'] > ctx['maxspareworkers']:
-				cf.log.warn("Minspareworkers %d is great than maxspareworkers %d, change minspareworkers to %d" %(ctx['minspareworkers'], ctx['maxspareworkers'], ctx['maxspareworkers']))
-				ctx['minspareworkers'] = ctx['maxspareworkers']
-			pf = pid_file(ctx['pidfile'])
-			if pf.is_exists():
-				pids = pf.read()
-				if is_running(pids):
-					if action == 'start':
-						cf.log.error("%s (pid %s ) is running" %(progname, " ".join(str(pid) for pid in pids)))
-						os._exit(1)
-					elif action == 'reload':
-						kill_pids(pids, signal.SIGHUP)
-						os._exit(0)
-					elif action == 'reopen':
-						kill_pids(pids, signal.SIGUSR1)
-						os._exit(0)
-					elif action in ('stop', 'restart'):
-						kill_pids(pids, signal.SIGTERM)
-						while True:
-							time.sleep(0.01)
-							if not is_running(pids):
-								break
-						if action == 'stop':
-							os._exit(0)
-				else:
-					if action == 'stop':
-						cf.log.error("is not running, but pid file is exists")
-						os._exit(1)
-					elif action == 'reload' or action == 'reopen':
-						cf.log.error("is not running, but pid file is exists")
-						os._exit(1)
-			else:
-				if action in ('stop', 'restart'):
-					cf.log.error("is not running, is already stoped")
-				if action == 'stop':
+				cf.log.error('Check failed')
+			os._exit(1)
+		if action == 'check':
+			cf.log.info('Check ok')
+			os._exit(0)
+		ctx = cf.conf['ctx']
+		ctx['maxworkers'] = zc_dict_get_ge(ctx, 'maxworkers', 0, ZC_DEF_MAXWORKERS)
+		ctx['startworkers'] = zc_dict_get_ge(ctx, 'startworkers', 0, ZC_DEF_STARTWORKERS)
+		ctx['minspareworkers'] = zc_dict_get_ge(ctx, 'minspareworkers', 0, ZC_DEF_MINSPAREWORKERS)
+		ctx['maxspareworkers'] = zc_dict_get_ge(ctx, 'maxspareworkers', 0, ZC_DEF_MAXSPAREWORKERS)
+		ctx['logfile'] = ctx.get('logfile', ZC_DEF_LOGFILE)
+		ctx['loglevel'] = ctx.get('loglevel', ZC_DEF_LOGLEVEL)
+		ctx['user'] = ctx.get('user')
+		ctx['group'] = ctx.get('group')
+		ctx['pidfile'] = ctx.get('pidfile', ZC_DEF_PIDFILE)
+		ctx['count_interval'] = zc_dict_get_ge(ctx, 'count_interval', 0, ZC_DEF_COUNT_INTERVAL)
+		if ctx['user'] != None:
+			pw = pwd.getpwnam(ctx['user'])
+			ctx['user'] = pw.pw_uid
+		if ctx['group'] != None:
+			gr = grp.getgrnam(ctx['group'])
+			ctx['group'] = gr.gr_gid
+		if ctx['maxworkers'] < 1:
+			cf.log.error("Number maxwokers can't less than 1")
+			os._exit(1)
+		if ctx['minspareworkers'] < 0 or ctx['maxspareworkers'] < 0:
+			cf.log.error("Number minspareworkers or maxspareworkers can't less than 0")
+			os._exit(1)
+		if ctx['startworkers'] > ctx['maxworkers']:
+			cf.log.warn("Startworkers %d is great than maxworkers %d, change startworkers to %d" %(ctx['startworkers'], ctx['maxworkers'], ctx['maxworkers']))
+			ctx['startworkers'] = ctx['maxworkers']
+		if ctx['minspareworkers'] > ctx['maxspareworkers']:
+			cf.log.warn("Minspareworkers %d is great than maxspareworkers %d, change minspareworkers to %d" %(ctx['minspareworkers'], ctx['maxspareworkers'], ctx['maxspareworkers']))
+			ctx['minspareworkers'] = ctx['maxspareworkers']
+		pf = pid_file(ctx['pidfile'])
+		if pf.is_exists():
+			pids = pf.read()
+			if is_running(pids):
+				if action == 'start':
+					cf.log.error("%s (pid %s ) is running" %(progname, " ".join(str(pid) for pid in pids)))
 					os._exit(1)
-					
+				elif action == 'reload':
+					kill_pids(pids, signal.SIGHUP)
+					os._exit(0)
+				elif action == 'reopen':
+					kill_pids(pids, signal.SIGUSR1)
+					os._exit(0)
+				elif action in ('stop', 'restart'):
+					kill_pids(pids, signal.SIGTERM)
+					while True:
+						time.sleep(0.01)
+						if not is_running(pids):
+							break
+					if action == 'stop':
+						os._exit(0)
+			else:
+				if action == 'stop':
+					cf.log.error("is not running, but pid file is exists")
+					os._exit(1)
+				elif action == 'reload' or action == 'reopen':
+					cf.log.error("is not running, but pid file is exists")
+					os._exit(1)
+		else:
+			if action in ('stop', 'restart'):
+				cf.log.error("is not running, is already stoped")
+			if action == 'stop':
+				os._exit(1)
 				
-			action = None
-			if not reconfigure and daemon:
-				create_daemon()
-			pf.write(["%d" %(os.getpid())])
-		oldlogfh = logfh
+			
+		action = None
+		if not reconfigure and daemon:
+			create_daemon(cf)
+		pf.write(["%d" %(os.getpid())])
+		oldloghandler = loghandler
 		try:
-			logfh = open(ctx['logfile'], 'a')
-		except IOError, e:
-			cf.log.error("Can't open %s: %s" %(ctx['logfile'], e))
+			loghandler = zc_log.Handler(file=ctx['logfile'], format="%(asctime)s - %(levelname)s - " + progname + "[%(process)d]:  %(message)s")
+		except zc_log.error, e:
+			cf.log.error("Can't init handler: %s" %(e))
+			os._exit(1)
+		try:
+			cf.log.addHandler(loghandler)
+		except zc_log.error, e:
+			cf.log.error("Can't open %s: %s"  %(ctx['logfile'], e))
 			os._exit(1)
 		if not reconfigure and not debug:
 			cf.log.removeHandler(stderr_handler)
 			stderr_handler.close()
-		oldloghandler = loghandler
-		loghandler=logging.StreamHandler(logfh)
-		formatter = logging.Formatter("%(asctime)s - %(levelname)s - " + progname + "[%(process)d]:  %(message)s")
-		loghandler.setFormatter(formatter)
-		cf.log.addHandler(loghandler)
 		cf.log.setLevel(ctx['loglevel'])
-		if oldlogfh == None:
-			sys.stdout.close()
-			sys.stderr.close()
-		else:
+		if not debug:
+			oldstdout = sys.stdout
+			oldstderr = sys.stderr
+			sys.stdout = loghandler.stream
+			sys.stderr = loghandler.stream
+		if oldloghandler == None and not debug:
+			os.close(sys.stdin.fileno())
+			os.close(oldstdout.fileno())
+			os.close(oldstderr.fileno())
+		if oldloghandler:
 			cf.log.removeHandler(oldloghandler)
 			oldloghandler.close()
-			oldlogfh.close()
 			oldloghandler = None
-			oldlogfh = None
-		sys.stdout = logfh
-		sys.stderr = logfh
-		if not reopen:
-			for m in cf.modules:
-				if m.type != ZC_CORE_MODULE:
-					continue
-				if m.init_master == None:
-					continue
-				if m.init_master(cf, cf.conf['modules'][m.ctx_index], tasks) == ZC_ERROR:
-					os._exit(1)
-		if poll != None:
+		for m in cf.modules:
+			if m.type != ZC_CORE_MODULE:
+				continue
+			if m.init_master == None:
+				continue
+			if m.init_master(cf, cf.conf['modules'][m.ctx_index], tasks) == ZC_ERROR:
+				os._exit(1)
+		if poll != None and poll_type == 'epoll':
 			poll.close()
 		if 'use' in ctx and ctx['use'] == "epoll":
 			if hasattr(select, 'epoll'):
@@ -798,28 +949,23 @@ def master_process():
 		else:
 			poll_type = 'poll'
 		if poll_type == 'epoll':
-			poll = select.epoll()
+			poll = zc_events_epoll()
 		else:
-			poll = select.poll()
-		if not reopen:
-			setproctitle('%s: master process %s' %(progname, name))
+			poll = zc_events_poll()
+		setproctitle('%s: master process %s' %(progname, name))
 		if reconfigure:
 			reconfigure = False
-		if reopen:
-			reopen = False
+			cf.log.all("Reloaded")
+		else:
+			cf.log.all("Started")
 		event_cycle(cf)
 		if shutdown:
-			cf.log.info("shutdown")
+			cf.log.all("Shutdown")
 			break
-		if reconfigure:
-			cf.log.info("reload config file")
-			continue
-		if reopen:
-			cf.log.info("reopen log file")
-			continue
+		elif reconfigure:
+			cf.log.all("Reload config file")
+	loghandler.stream.close()
 	loghandler.close()
-	logging.shutdown()
-	logfh.close()
 	pf.remove()
 	os._exit(rc)
 

@@ -37,8 +37,8 @@ def merge_service_conf(cf, parent, child):
 	pctx = parent['modules'][module.ctx_index]
 	stype = child['ctx']['type']
 	zc_dict_set_no_has(ctx, pctx, 'http_connect_timeout', 'http_timeout', 'http_method', 'http_version')
-	ctx['http_connect_timeout'] = zc_dict_get_gt(ctx, 'http_connect_timeout', 0, HTTP_DEF_CONNECT_TIMEOUT)
-	ctx['http_timeout'] = zc_dict_get_gt(ctx, 'http_timeout', 0, HTTP_DEF_TIMEOUT)
+	ctx['http_connect_timeout'] = zc_dict_get_ge(ctx, 'http_connect_timeout', 0, HTTP_DEF_CONNECT_TIMEOUT)
+	ctx['http_timeout'] = zc_dict_get_ge(ctx, 'http_timeout', 0, HTTP_DEF_TIMEOUT)
 	ctx['http_method'] = ctx.get('http_method', HTTP_DEF_METHOD)
 	ctx['http_version'] = ctx.get('http_version', HTTP_DEF_VERSION)
 	if stype in module.ctx.service_types:
@@ -70,7 +70,7 @@ def task_handler(log, task):
 			status = c.request(url)
 		finally:
 			c.close()
-	except ZC_Error as e:
+	except Exception, e:
 		use_time = time.time() - now
 		log.error('%s "%s %s %s" %.6fs %s' %(task['task_info'], mctx['http_method'], mctx['http_url'], mctx['http_version'], use_time, e))
 		return None
@@ -78,23 +78,25 @@ def task_handler(log, task):
 		m = re.match(r'^Active connections: (\d+) \nserver accepts handled requests\n (\d+) (\d+) (\d+) \nReading: (\d+) Writing: (\d+) Waiting: (\d+) \n$', status['body'])
 		if m == None:
 			use_time = time.time() - now
-			log.debug("nginx status page:\n%s", status['body'])
+			log.debug("nginx status page:\n%s" %(status['body']))
 			log.error('%s "%s %s %s" %.6fs Nginx status page not match' %(task['task_info'], mctx['http_method'], mctx['http_url'], mctx['http_version'], use_time))
 			return None
 		else:
-			status['nginx_active_connections'] = int(m.group(1))
-			status['nginx_accepts'] = int(m.group(1))
-			status['nginx_handled'] = int(m.group(2))
-			status['nginx_requests'] = int(m.group(3))
-			status['nginx_reading'] = int(m.group(4))
-			status['nginx_writing'] = int(m.group(5))
-			status['nginx_waiting'] = int(m.group(6))
+			status['active_connections'] = int(m.group(1))
+			status['accepts']            = int(m.group(2))
+			status['handled']            = int(m.group(3))
+			status['requests']           = int(m.group(4))
+			status['reading']            = int(m.group(5))
+			status['writing']            = int(m.group(6))
+			status['waiting']            = int(m.group(7))
 	del status['body']
 	del status['header']
 	use_time = time.time() - now
 	log.info('%s "%s %s %s" %.6fs' %(task['task_info'], mctx['http_method'], mctx['http_url'], mctx['http_version'], use_time))
-	status['_check_use_time_'] = use_time
-	return status
+	r = []
+	for key in status:
+		r.append({'key' : key, 'value': status[key]})
+	return r
 
 def conf_set_httpversion_slot(cf, cmd, conf):
 	if zc_conf_check_slot(cf, cmd, conf) != ZC_OK:

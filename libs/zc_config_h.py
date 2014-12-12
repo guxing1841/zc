@@ -2,8 +2,9 @@
 Config common
 Copyright (C) Zhou Changrong
 """
-import os, stat, re, logging
-ZC_VERSION           = "0.3.0"
+import os, stat, re, glob
+import zc_log
+ZC_VERSION           = "0.6.0"
 
 ZC_CONF_NOARGS    = 0x00000001
 ZC_CONF_TAKE1     = 0x00000002
@@ -46,7 +47,8 @@ ZC_SPARE       = 101
 ZC_PREPARE     = 102
 ZC_IGNORE      = 103
 
-ZC_LOG_LEVELS = {'DEBUG' : logging.DEBUG, 'INFO' : logging.INFO, 'WARNING' : logging.WARNING, 'ERROR' : logging.ERROR, 'CRITICAL' : logging.CRITICAL}
+#ZC_LOG_LEVELS = {'DEBUG' : logging.DEBUG, 'INFO' : logging.INFO, 'WARNING' : logging.WARNING, 'ERROR' : logging.ERROR, 'CRITICAL' : logging.CRITICAL}
+ZC_LOG_LEVELS = {'DEBUG' : zc_log.DEBUG, 'INFO' : zc_log.INFO, 'WARNING' : zc_log.WARNING, 'ERROR' : zc_log.ERROR, 'CRITICAL' : zc_log.CRITICAL}
 
 
 
@@ -137,6 +139,8 @@ def zc_conf_set_key_slot(cf, cmd, conf):
 	if cmd.key == None:
 		cf.log.error("command '%s' is not defined in %s at line %d: %d" %(cf.args[1], cf.cur['conf_file'], cf.cur['start_line'],  cf.cur['start_col']))
 		return ZC_ERROR
+	if cmd.key not in conf:
+		conf[cmd.key] = {} 
 	conf[cmd.key][cf.args[1]]=cf.args[2]
 	return ZC_OK
 
@@ -171,7 +175,7 @@ excape_sigle_table = {
 	}
 
 
-class zc_conf_file():
+class zc_conf_file:
 	def __init__(cf, buffer_size = 4096):
 		cf.macro = False
 		cf.cur = None
@@ -214,7 +218,7 @@ class zc_conf_file():
 			cf.log.error("Too many arguments '%s' in %s at %d: %d" %(cf.cmd.name, cf.cur['conf_file'], cf.cur['start_line'],  cf.cur['start_col']))
 			return ZC_ERROR
 		elif not (cf.cmd.type & ZC_CONF_ARGS_NUMBERS[len(cf.args)-1]):
-			cf.log.error("Invalid number arguments '%s' in %s at %d: %d" %(cf.cmd.name, cf.cur['conf_file'], cf.cur['start_line'],  cf.cur['start_col']))
+			cf.log.error("Invalid number of arguments '%s' in %s at %d: %d" %(cf.cmd.name, cf.cur['conf_file'], cf.cur['start_line'],  cf.cur['start_col']))
 			return ZC_ERROR
 		if cf.cmd.set != None:
 			if cf.cmd.type & ZC_CONF_DIRECT:
@@ -469,8 +473,10 @@ class zc_conf_file():
 
 def zc_conf_include(cf, cmd, conf):
 	prev = cf.cur
-	if cf.file_parser(cf.args[1]) == ZC_ERROR:
-		return ZC_ERROR
+	files = glob.glob(cf.args[1])
+	for file in files:	
+		if cf.file_parser(file) == ZC_ERROR:
+			return ZC_ERROR
 	cf.cur = prev
 	return ZC_OK
 
